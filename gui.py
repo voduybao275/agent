@@ -17,7 +17,8 @@ from agent.loop import Agent
 from agent.memory import Memory
 from agent.prompt import build_system_prompt
 from agent.skills import SkillManager
-from agent.tools import ToolRegistry, build_builtin_tools
+from agent.tools import ToolRegistry, build_builtin_tools, build_image_tool
+from agent.vision import Vision
 from learning.distill import distill_skill
 from learning.export import export_dpo, export_sft
 from learning.feedback import apply_feedback
@@ -79,6 +80,7 @@ class AgentApp:
         self.queue: queue.Queue = queue.Queue()
         self.busy = False
         self._started_at = 0.0
+        self._pending_image: str | None = None
 
         self.registry = ToolRegistry()
         for spec in build_builtin_tools(cfg.workspace, cfg.shell):
@@ -93,6 +95,16 @@ class AgentApp:
             temperature=cfg.temperature,
             timeout=cfg.timeout,
         )
+        self.vision = Vision(
+            LLM(
+                base_url=cfg.provider.base_url,
+                model=cfg.provider.vision_model or cfg.provider.model,
+                api_key=cfg.provider.api_key,
+                temperature=0.0,
+                timeout=cfg.timeout,
+            )
+        )
+        self.registry.register(build_image_tool(cfg.workspace, self.vision))
         self.agent = Agent(
             llm=self.llm,
             registry=self.registry,
@@ -100,6 +112,7 @@ class AgentApp:
             max_steps=cfg.max_steps,
             verbose=False,
             on_event=lambda event: self.queue.put(("event", event)),
+            vision=self.vision,
         )
 
         self._build_ui()
@@ -212,8 +225,10 @@ class AgentApp:
         self.input_box.grid(row=0, column=0, sticky="ew")
         input_side = ttk.Frame(input_card)
         input_side.grid(row=0, column=1, sticky="ns", padx=(0, 10), pady=8)
+        self.attach_btn = ttk.Button(input_side, text="Ảnh…", command=self._attach_image)
+        self.attach_btn.pack(side="top")
         self.send_btn = ttk.Button(input_side, text="Gửi", style="Accent.TButton", command=self._send)
-        self.send_btn.pack(side="top")
+        self.send_btn.pack(side="top", pady=(6, 0))
         ttk.Label(
             input_side,
             text="Enter gửi\nShift+Enter xuống dòng",
@@ -223,6 +238,13 @@ class AgentApp:
         ).pack(side="top", pady=(6, 0))
         self.input_box.bind("<Return>", self._on_return)
         self.input_box.bind("<Shift-Return>", self._on_shift_return)
+
+        self.attach_var = tk.StringVar(value="")
+        self.attach_row = ttk.Frame(input_card)
+        self.attach_row.grid(row=1, column=0, columnspan=2, sticky="w", padx=12, pady=(0, 8))
+        ttk.Label(self.attach_row, textvariable=self.attach_var, style="CardMuted.TLabel").pack(side="left")
+        ttk.Button(self.attach_row, text="Bỏ ảnh", command=self._clear_image).pack(side="left", padx=(8, 0))
+        self.attach_row.grid_remove()
 
         side = tk.Frame(body, bg=CARD, width=SIDE_WIDTH, highlightthickness=1, highlightbackground=BORDER)
         side.grid(row=0, column=1, sticky="ns")
@@ -303,7 +325,8 @@ class AgentApp:
         self.transcript.configure(state="normal")
         self.transcript.insert(
             "end",
-            "Sẵn sàng. Hỏi bất cứ điều gì — agent tự gọi tool/skill khi cần.\n",
+            "Sẵn sàng. Hỏi bất cứ điều gì — agent tự gọi tool/skill khi cần. "
+            "Dùng nút Ảnh… để đính kèm hình ảnh cho agent đọc.\n",
             "hint",
         )
         self.transcript.configure(state="disabled")
@@ -349,23 +372,55 @@ class AgentApp:
         if self.busy:
             return
         text = self.input_box.get("1.0", "end").strip()
-        if not text:
+        image = self._pending_image
+        if not text and not image:
             return
+        if not text:
+            text = "Hãy đọc và mô tả hình ảnh này."
+        display = f"[ảnh: {Path(image).name}] {text}" if image else text
         self.input_box.delete("1.0", "end")
-        self._append_chat("user", text)
-        self._log("info", f"Bạn: {_clip(text, 120)}")
+        self._clear_image()
+        self._append_chat("user", display)
+        self._log("info", f"Bạn: {_clip(display, 120)}")
         self._started_at = time.monotonic()
-        self._set_busy(True, "Đang gọi model…")
-        threading.Thread(target=self._worker_ask, args=(text,), daemon=True).start()
+        self._set_busy(True, "Đang đọc ảnh…" if image else "Đang gọi model…")
+        threading.Thread(
+            target=self._worker_ask,
+            args=(text, [image] if image else None, display),
+            daemon=True,
+        ).start()
 
-    def _worker_ask(self, text: str) -> None:
+    def _attach_image(self) -> None:
+        if self.busy:
+            return
+        chosen = filedialog.askopenfilename(
+            parent=self.root,
+            title="Chọn ảnh để agent đọc",
+            filetypes=[
+                ("Ảnh", "*.png *.jpg *.jpeg *.webp *.gif *.bmp"),
+                ("Tất cả", "*.*"),
+            ],
+        )
+        if not chosen:
+            return
+        self._pending_image = chosen
+        self.attach_var.set(f"Ảnh đính kèm: {Path(chosen).name}")
+        self.attach_row.grid()
+        self._log("info", f"Đính kèm ảnh: {chosen}")
+
+    def _clear_image(self) -> None:
+        self._pending_image = None
+        self.attach_var.set("")
+        self.attach_row.grid_remove()
+
+    def _worker_ask(self, text: str, images: list[str] | None = None, display: str | None = None) -> None:
         try:
-            answer = self.agent.run(text)
+            answer = self.agent.run(text, images=images)
             skills = list(self.agent.last_used_skills)
         except Exception as exc:
             self.queue.put(("error", f"{type(exc).__name__}: {exc}"))
             return
-        self.queue.put(("answer", {"question": text, "answer": answer, "skills": skills}))
+        self.queue.put(("answer", {"question": display or text, "answer": answer, "skills": skills}))
 
     # ---------- queue ----------
 
@@ -415,6 +470,7 @@ class AgentApp:
         self.busy = busy
         state = "disabled" if busy else "normal"
         self.send_btn.configure(state=state)
+        self.attach_btn.configure(state=state)
         self.learn_btn.configure(state=state)
         self.new_btn.configure(state=state)
         if status:

@@ -3,7 +3,10 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from .vision import Vision
 
 MAX_TOOL_OUTPUT = 8000
 
@@ -196,3 +199,35 @@ def build_builtin_tools(workspace: Path, shell: str) -> list[ToolSpec]:
             func=run_shell,
         ),
     ]
+
+
+def build_image_tool(workspace: Path, vision: "Vision") -> ToolSpec:
+    root = workspace.resolve()
+
+    def read_image(path: str, question: str = "") -> str:
+        target = Path(path)
+        resolved = target.resolve() if target.is_absolute() else (root / target).resolve()
+        if resolved != root and root not in resolved.parents:
+            raise PermissionError(f"đường dẫn ngoài workspace: {resolved}")
+        text = vision.describe(resolved, question)
+        return f"Mô tả ảnh {resolved.name}:\n{text}"
+
+    return ToolSpec(
+        name="read_image",
+        description=(
+            "Đọc nội dung hình ảnh trong workspace: mô tả chi tiết và trích xuất chữ trong ảnh "
+            "bằng model vision. Dùng khi cần xem ảnh chụp màn hình, ảnh thiết kế, sơ đồ, biểu đồ."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Đường dẫn tương đối với workspace"},
+                "question": {
+                    "type": "string",
+                    "description": "Điều cần tìm hiểu trong ảnh (để trống: mô tả toàn bộ + OCR)",
+                },
+            },
+            "required": ["path"],
+        },
+        func=read_image,
+    )

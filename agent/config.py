@@ -14,6 +14,7 @@ class ProviderConfig:
     model: str
     api_key: str
     api_key_env: str
+    vision_model: str = ""
 
 
 @dataclass
@@ -55,6 +56,11 @@ class Config:
         model_name = model or os.environ.get("AGENT_MODEL") or provider_raw.get("model", "")
         if not model_name:
             raise SystemExit(f"Provider '{active}' chưa có model.")
+        vision_model = (
+            os.environ.get("AGENT_VISION_MODEL")
+            or provider_raw.get("vision_model", "")
+            or model_name
+        )
 
         shell = agent_raw.get("shell", "auto")
         if shell == "auto":
@@ -87,6 +93,7 @@ class Config:
                 model=model_name,
                 api_key=api_key,
                 api_key_env=key_env,
+                vision_model=vision_model,
             ),
         )
 

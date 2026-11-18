@@ -28,7 +28,7 @@ def main() -> int:
     from agent.memory import Memory
     from agent.prompt import build_system_prompt
     from agent.skills import SkillManager
-    from agent.tools import ToolRegistry, build_builtin_tools
+    from agent.tools import ToolRegistry, build_builtin_tools, build_image_tool
     from learning.distill import distill_skill
     from learning.export import export_dpo, export_sft
     from learning.feedback import apply_feedback
@@ -51,6 +51,11 @@ def main() -> int:
     parser.add_argument("--format", choices=["sft", "dpo"], default="sft", help="Định dạng dữ liệu export")
     parser.add_argument("--min-rating", type=int, default=4, help="Ngưỡng rating cho SFT (mặc định 4)")
     parser.add_argument("--out", help="File JSONL đầu ra (mặc định data/<format>.jsonl)")
+    parser.add_argument(
+        "--image",
+        action="append",
+        help="File ảnh cần đọc, có thể lặp lại (dùng cho lệnh ask)",
+    )
     args = parser.parse_args()
 
     cfg = Config.load(args.config, provider=args.provider, model=args.model)
@@ -78,6 +83,8 @@ def main() -> int:
         registry.register(spec)
     skills = SkillManager(cfg.skills_dir, cfg.examples_in_context)
     skills.register_load_tool(registry)
+    vision = _build_vision(cfg)
+    registry.register(build_image_tool(cfg.workspace, vision))
     memory = Memory(cfg.memory_db)
 
     if args.command == "tools":
@@ -110,20 +117,29 @@ def main() -> int:
         system_prompt=build_system_prompt(cfg.workspace, skills.catalog(), cfg.shell),
         max_steps=cfg.max_steps,
         verbose=not args.quiet,
+        vision=vision,
     )
 
     if args.command == "ask":
         question = " ".join(args.prompt).strip()
-        if not question:
-            print('Thiếu câu hỏi. Ví dụ: py main.py ask "liệt kê file trong workspace"', file=sys.stderr)
+        images = args.image or []
+        if not question and not images:
+            print(
+                'Thiếu câu hỏi. Ví dụ: py main.py ask --image photo.png "ảnh này có gì?"',
+                file=sys.stderr,
+            )
             return 2
+        record_question = question or "Hãy đọc và mô tả hình ảnh này."
+        if images:
+            names = ", ".join(Path(image).name for image in images)
+            record_question = f"[ảnh: {names}] {record_question}"
         try:
-            answer = agent.run(question)
-        except LLMError as exc:
-            print(f"Lỗi LLM: {exc}", file=sys.stderr)
+            answer = agent.run(question or "Hãy đọc và mô tả hình ảnh này.", images=images or None)
+        except (LLMError, OSError, ValueError, RuntimeError) as exc:
+            print(f"Lỗi: {exc}", file=sys.stderr)
             return 1
         print(answer)
-        memory.record_turn(question, answer, agent.last_used_skills)
+        memory.record_turn(record_question, answer, agent.last_used_skills)
         return 0
 
     return _chat(
@@ -148,6 +164,21 @@ def _build_llm(cfg):
         api_key=cfg.provider.api_key,
         temperature=cfg.temperature,
         timeout=cfg.timeout,
+    )
+
+
+def _build_vision(cfg):
+    from agent.llm import LLM
+    from agent.vision import Vision
+
+    return Vision(
+        LLM(
+            base_url=cfg.provider.base_url,
+            model=cfg.provider.vision_model or cfg.provider.model,
+            api_key=cfg.provider.api_key,
+            temperature=0.0,
+            timeout=cfg.timeout,
+        )
     )
 
 
@@ -261,7 +292,10 @@ def _chat(
 ) -> int:
     print(f"provider={cfg.provider.name} model={cfg.provider.model}")
     print(f"workspace={cfg.workspace}")
-    print("Lệnh: /exit | /reset | /skills | /tools | /skill <tên> | /learn | /stats | /distill [tên]\n")
+    print(
+        "Lệnh: /exit | /reset | /skills | /tools | /skill <tên> | /image <ảnh> [câu hỏi] "
+        "| /learn | /stats | /distill [tên]\n"
+    )
 
     while True:
         try:
@@ -295,6 +329,22 @@ def _chat(
         if line == "/distill" or line.startswith("/distill "):
             only = line.split(maxsplit=1)[1].strip() if " " in line else None
             _run_distill(skills, llm, only, distill_skill, llm_error)
+            continue
+        if line.startswith("/image "):
+            rest = line[len("/image "):].strip().strip('"').strip("'")
+            path, _, question = rest.partition(" ")
+            path, question = path.strip(), question.strip()
+            if not path:
+                print("Dùng: /image <đường dẫn ảnh> [câu hỏi]")
+                continue
+            ask = question or "Hãy đọc và mô tả hình ảnh này."
+            try:
+                answer = agent.run(ask, images=[path])
+            except (llm_error, OSError, ValueError, RuntimeError) as exc:
+                print(f"Lỗi đọc ảnh: {exc}")
+                continue
+            memory.record_turn(f"[ảnh: {Path(path).name}] {ask}", answer, agent.last_used_skills)
+            print(f"\nagent> {answer}\n")
             continue
 
         try:

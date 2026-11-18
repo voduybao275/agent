@@ -20,9 +20,11 @@ active = "ollama"        # đổi thành "openai" để dùng API cloud
 [providers.openai]
 base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
+vision_model = "gpt-4o-mini"   # model đọc ảnh (rỗng = dùng model chính)
 api_key_env = "OPENAI_API_KEY"
 
 [providers.ollama]
 base_url = "http://localhost:11434/v1"
 model = "qwen2.5:3b"
+vision_model = "qwen2.5vl:3b"  # model đọc ảnh: py .tools/ollama/ollama.exe pull qwen2.5vl:3b
 api_key_env = ""

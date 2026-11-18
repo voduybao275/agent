@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Callable
 
 from .llm import LLM
 from .tools import ToolRegistry
+from .vision import Vision
 
 MAX_RESULT_CHARS = 12000
 
@@ -18,12 +20,14 @@ class Agent:
         max_steps: int = 12,
         verbose: bool = True,
         on_event: Callable[[dict], None] | None = None,
+        vision: Vision | None = None,
     ) -> None:
         self.llm = llm
         self.registry = registry
         self.max_steps = max_steps
         self.verbose = verbose
         self.on_event = on_event
+        self.vision = vision
         self._system_prompt = system_prompt
         self.messages: list[dict] = [{"role": "system", "content": system_prompt}]
         self.last_used_skills: list[str] = []
@@ -39,9 +43,47 @@ class Agent:
     def reset(self) -> None:
         self.messages = [{"role": "system", "content": self._system_prompt}]
 
-    def run(self, user_input: str) -> str:
+    def run(self, user_input: str, images: list[str] | None = None) -> str:
         self.last_used_skills = []
-        self.messages.append({"role": "user", "content": user_input})
+        if images:
+            if self.vision is None:
+                raise RuntimeError(
+                    "Chưa cấu hình chức năng đọc ảnh: đặt vision_model trong [providers.*] của config.toml."
+                )
+            self.messages.append(
+                {"role": "user", "content": user_input.strip() or "Hãy đọc và mô tả hình ảnh này."}
+            )
+            for index, image in enumerate(images, 1):
+                note = {
+                    "call_id": f"image_{index}",
+                    "name": Path(image).name,
+                    "description": self.vision.describe(image),
+                }
+                self.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": note["call_id"],
+                                "type": "function",
+                                "function": {
+                                    "name": "read_image",
+                                    "arguments": json.dumps({"path": note["name"]}, ensure_ascii=False),
+                                },
+                            }
+                        ],
+                    }
+                )
+                self.messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": note["call_id"],
+                        "content": f"Đã đọc ảnh {note['name']}:\n{note['description']}",
+                    }
+                )
+        else:
+            self.messages.append({"role": "user", "content": user_input})
 
         for step in range(1, self.max_steps + 1):
             message = self.llm.chat(self.messages, tools=self.registry.schemas() or None)
