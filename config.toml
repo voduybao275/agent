@@ -5,7 +5,12 @@ workspace = "."          # thư mục agent được đọc/ghi
 shell = "auto"           # auto | bash | cmd | powershell
 max_steps = 12
 temperature = 0.2
-timeout = 120
+timeout = 300            # model vision local cần thời gian nạp
+workspaces = "data/workspaces.json"
+
+[chat]
+history = "data/chat.json"   # lịch sử hội thoại GUI
+turns = 20                   # số lượt giữ lại mỗi hội thoại (0 = tắt)
 
 [skills]
 dir = "skills"

@@ -26,7 +26,12 @@ class LLM:
         self.temperature = temperature
         self.timeout = timeout
 
-    def chat(self, messages: list[dict], tools: list[dict] | None = None) -> dict:
+    def chat(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        max_tokens: int | None = None,
+    ) -> dict:
         payload: dict = {
             "model": self.model,
             "messages": messages,
@@ -35,6 +40,8 @@ class LLM:
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        if max_tokens:
+            payload["max_tokens"] = max_tokens
 
         headers = {"Content-Type": "application/json"}
         if self.api_key:

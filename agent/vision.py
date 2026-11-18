@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import base64
 import mimetypes
+import re
+import unicodedata
 from pathlib import Path
 
 from .llm import LLM, LLMError
@@ -17,6 +19,47 @@ DEFAULT_PROMPT = (
     "Trả lời trực tiếp, không nhắc lại yêu cầu."
 )
 
+UI_PROMPT = (
+    "Mô tả ảnh giao diện để dựng lại bằng HTML/CSS. Trả lời tối đa 12 dòng, không viết code:\n"
+    "- CHỮ: toàn bộ chữ nhìn thấy, nguyên văn, cách nhau bằng dấu phẩy.\n"
+    "- BỐ CỤC: các khối chính, tỉ lệ, khoảng cách ước lượng.\n"
+    "- MÀU: mã hex gần đúng cho nền, chữ, nút, viền.\n"
+    "- FONT & BO GÓC: sans/serif, đậm/nhạt, bo góc (px).\n"
+    "Chỉ nêu điều thấy trong ảnh; không lặp lại giá trị; chỗ không chắc ghi 'ước lượng'. "
+    "Trả lời trực tiếp, không nhắc lại yêu cầu."
+)
+
+UI_BUILD_INSTRUCTION = (
+    "Ảnh ở trên là mẫu giao diện cần dựng lại. Yêu cầu:\n"
+    "- Trả lời bằng MỘT file HTML duy nhất, CSS nằm trong <style>, không tải tài nguyên ngoài "
+    "(font hệ thống; icon bằng emoji/CSS/SVG đơn giản; ảnh thay bằng khối màu hoặc gradient).\n"
+    "- Giữ nguyên toàn bộ chữ nhìn thấy, đúng thứ tự và phân cấp; bám sát bố cục, màu sắc, "
+    "bo góc và khoảng cách theo đặc tả ở trên.\n"
+    "- Dùng thẻ semantic (header/nav/main/section/footer) và responsive cơ bản.\n"
+    "- Viết code gọn (khoảng 120 dòng), không lặp thuộc tính, không giải thích trong code.\n"
+    "- Nếu người dùng yêu cầu lưu file, dùng write_file để ghi file trong workspace; nếu không, "
+    "trả code trong một khối ```html duy nhất.\n"
+    "- Kết thúc bằng 2-3 gạch đầu dòng nêu phần đã ước lượng (màu, font, khoảng cách)."
+)
+
+_UI_PATTERN = re.compile(
+    r"\b(html|css|website|web|landing|dashboard|giao dien|trang|form|template|mockup|"
+    r"ui|ux|component|layout|dung lai|tai tao)\b"
+)
+
+
+def _fold(text: str) -> str:
+    lowered = text.lower().replace("đ", "d")
+    return "".join(
+        char for char in unicodedata.normalize("NFD", lowered)
+        if unicodedata.category(char) != "Mn"
+    )
+
+
+def is_ui_request(text: str) -> bool:
+    """True khi yêu cầu có khả năng cần dựng lại giao diện từ ảnh."""
+    return bool(_UI_PATTERN.search(_fold(text or "")))
+
 
 class Vision:
     """Đọc ảnh (mô tả + OCR) bằng model vision qua endpoint OpenAI-compatible."""
@@ -24,7 +67,9 @@ class Vision:
     def __init__(self, llm: LLM) -> None:
         self.llm = llm
 
-    def describe(self, image_path: str | Path, question: str = "") -> str:
+    def describe(
+        self, image_path: str | Path, question: str = "", max_tokens: int | None = None
+    ) -> str:
         path = Path(image_path)
         if not path.is_file():
             raise FileNotFoundError(f"không tìm thấy file ảnh: {path}")
@@ -56,7 +101,8 @@ class Vision:
                         {"type": "image_url", "image_url": {"url": data_url}},
                     ],
                 }
-            ]
+            ],
+            max_tokens=max_tokens,
         )
         text = (reply.get("content") or "").strip()
         if not text:

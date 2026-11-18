@@ -95,6 +95,10 @@ class SkillManager:
     def names(self) -> list[str]:
         return sorted(self.skills)
 
+    def reset_tool_state(self) -> None:
+        for skill in self.skills.values():
+            skill.tools_loaded = False
+
     def catalog(self) -> str:
         if not self.skills:
             return "(chưa có skill nào)"

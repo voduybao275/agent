@@ -27,6 +27,9 @@ class Config:
     skills_dir: Path
     examples_in_context: int
     memory_db: Path
+    chat_history: Path
+    history_turns: int
+    workspaces_file: Path
     provider: ProviderConfig
 
     @classmethod
@@ -78,6 +81,15 @@ class Config:
         if not memory_db.is_absolute():
             memory_db = path.parent / memory_db
 
+        chat_raw = raw.get("chat", {})
+        chat_history = Path(chat_raw.get("history", "data/chat.json"))
+        if not chat_history.is_absolute():
+            chat_history = path.parent / chat_history
+
+        workspaces_file = Path(agent_raw.get("workspaces", "data/workspaces.json"))
+        if not workspaces_file.is_absolute():
+            workspaces_file = path.parent / workspaces_file
+
         return cls(
             workspace=workspace.resolve(),
             shell=shell,
@@ -87,6 +99,9 @@ class Config:
             skills_dir=skills_dir.resolve(),
             examples_in_context=int(raw.get("skills", {}).get("examples_in_context", 3)),
             memory_db=memory_db.resolve(),
+            chat_history=chat_history.resolve(),
+            history_turns=int(chat_raw.get("turns", 20)),
+            workspaces_file=workspaces_file.resolve(),
             provider=ProviderConfig(
                 name=active,
                 base_url=provider_raw["base_url"],

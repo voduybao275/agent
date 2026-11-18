@@ -5,6 +5,10 @@ __pycache__/
 
 # Runtime data / binaries
 memory.db
+data/chat.json*
+data/workspaces.json*
+agent.zip
+*.zip
 .tools/
 .ollama-models/
 .venv/

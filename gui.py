@@ -3,15 +3,21 @@ from __future__ import annotations
 import json
 import os
 import queue
+import re
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
+import webbrowser
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
+from typing import Callable
 
+from agent.clipboard import grab_clipboard_image
 from agent.config import Config
+from agent.history import ChatHistory
 from agent.llm import LLM
 from agent.loop import Agent
 from agent.memory import Memory
@@ -19,6 +25,7 @@ from agent.prompt import build_system_prompt
 from agent.skills import SkillManager
 from agent.tools import ToolRegistry, build_builtin_tools, build_image_tool
 from agent.vision import Vision
+from agent.workspaces import WorkspaceManager
 from learning.distill import distill_skill
 from learning.export import export_dpo, export_sft
 from learning.feedback import apply_feedback
@@ -39,6 +46,40 @@ SIDE_WIDTH = 320
 def _clip(text: str, limit: int) -> str:
     text = " ".join(str(text).split())
     return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _display_stamp(value: str) -> str:
+    try:
+        when = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return "trước đó"
+    now = datetime.now()
+    if when.date() == now.date():
+        return when.strftime("%H:%M")
+    if when.year == now.year:
+        return when.strftime("%d/%m %H:%M")
+    return when.strftime("%d/%m/%Y %H:%M")
+
+
+HTML_BLOCK_RE = re.compile(r"```([a-zA-Z]*)[ \t]*\n(.*?)```", re.DOTALL)
+
+
+def _extract_html(text: str) -> str | None:
+    for language, code in HTML_BLOCK_RE.findall(text or ""):
+        code = code.strip()
+        lowered = code.lower()
+        if language.lower() == "html" or any(
+            tag in lowered for tag in ("<html", "<!doctype", "<body")
+        ):
+            return code
+    lowered = (text or "").lower()
+    if "<html" not in lowered:
+        return None
+    start = lowered.find("<!doctype")
+    if start == -1:
+        start = lowered.find("<html")
+    end = lowered.rfind("</html>")
+    return text[start:end + 7 if end != -1 else len(text)].strip()
 
 
 def _init_streams() -> None:
@@ -81,13 +122,19 @@ class AgentApp:
         self.busy = False
         self._started_at = 0.0
         self._pending_image: str | None = None
+        self._last_html: str | None = None
+        self._ws_items: list[dict] = []
 
-        self.registry = ToolRegistry()
-        for spec in build_builtin_tools(cfg.workspace, cfg.shell):
-            self.registry.register(spec)
+        self.workspaces = WorkspaceManager(cfg.workspaces_file, cfg.workspace)
+        default_workspace = cfg.workspace
+        try:
+            self.workspace = self.workspaces.ensure_active()
+        except OSError:
+            self.workspace = cfg.workspace
+        self.cfg.workspace = self.workspace
+        os.environ["AGENT_WORKSPACE"] = str(self.workspace)
+
         self.skills = SkillManager(cfg.skills_dir, cfg.examples_in_context)
-        self.skills.register_load_tool(self.registry)
-        self.memory = Memory(cfg.memory_db)
         self.llm = LLM(
             base_url=cfg.provider.base_url,
             model=cfg.provider.model,
@@ -104,11 +151,13 @@ class AgentApp:
                 timeout=cfg.timeout,
             )
         )
-        self.registry.register(build_image_tool(cfg.workspace, self.vision))
+        self.registry = self._make_registry()
+        self.memory = Memory(cfg.memory_db)
+        self.history = ChatHistory(cfg.chat_history, cfg.history_turns, default_workspace)
         self.agent = Agent(
             llm=self.llm,
             registry=self.registry,
-            system_prompt=build_system_prompt(cfg.workspace, self.skills.catalog(), cfg.shell),
+            system_prompt=build_system_prompt(self.workspace, self.skills.catalog(), cfg.shell),
             max_steps=cfg.max_steps,
             verbose=False,
             on_event=lambda event: self.queue.put(("event", event)),
@@ -117,10 +166,22 @@ class AgentApp:
 
         self._build_ui()
         self._refresh_skills()
+        self._refresh_workspaces()
         self._refresh_last_turn()
+        self._restore_history()
         self._log("info", f"Sẵn sàng · {cfg.provider.name}/{cfg.provider.model}")
+        self._log("info", f"Workspace: {self.workspace}")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self.root.after(100, self._poll)
+        self._poll_id = self.root.after(100, self._poll)
+
+    def _make_registry(self) -> ToolRegistry:
+        registry = ToolRegistry()
+        for spec in build_builtin_tools(self.workspace, self.cfg.shell):
+            registry.register(spec)
+        self.skills.reset_tool_state()
+        self.skills.register_load_tool(registry)
+        registry.register(build_image_tool(self.workspace, self.vision))
+        return registry
 
     # ---------- UI ----------
 
@@ -169,16 +230,30 @@ class AgentApp:
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="Agent", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+
+        workspace_row = ttk.Frame(header)
+        workspace_row.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(3, 0))
+        ttk.Label(workspace_row, text="Workspace:", style="Muted.TLabel").pack(side="left")
+        self.workspace_box = ttk.Combobox(workspace_row, state="readonly", width=24)
+        self.workspace_box.pack(side="left", padx=(6, 0))
+        self.workspace_box.bind("<<ComboboxSelected>>", self._on_workspace_selected)
+        ttk.Button(workspace_row, text="Tạo…", command=self._create_workspace).pack(
+            side="left", padx=(6, 0)
+        )
+        ttk.Button(workspace_row, text="Quản lý", command=self._open_workspaces).pack(
+            side="left", padx=(6, 0)
+        )
         ttk.Label(
-            header,
-            text=f"{self.cfg.provider.name} · {self.cfg.provider.model} · shell {self.cfg.shell}",
+            workspace_row,
+            text=f"{self.cfg.provider.name}/{self.cfg.provider.model} · shell {self.cfg.shell}",
             style="Muted.TLabel",
-        ).grid(row=1, column=0, sticky="w")
+        ).pack(side="right")
 
         actions = ttk.Frame(header)
-        actions.grid(row=0, column=1, rowspan=2, sticky="e")
+        actions.grid(row=0, column=1, sticky="e")
         self.new_btn = ttk.Button(actions, text="Cuộc mới", command=self._new_chat)
         self.new_btn.pack(side="left", padx=(6, 0))
+        ttk.Button(actions, text="Lịch sử", command=self._open_history).pack(side="left", padx=(6, 0))
         ttk.Button(actions, text="Thống kê", command=self._show_stats).pack(side="left", padx=(6, 0))
         ttk.Button(actions, text="Nén (distill)", command=self._open_distill).pack(side="left", padx=(6, 0))
         ttk.Button(actions, text="Xuất dữ liệu", command=self._open_export).pack(side="left", padx=(6, 0))
@@ -229,15 +304,20 @@ class AgentApp:
         self.attach_btn.pack(side="top")
         self.send_btn = ttk.Button(input_side, text="Gửi", style="Accent.TButton", command=self._send)
         self.send_btn.pack(side="top", pady=(6, 0))
+        self.html_btn = ttk.Button(
+            input_side, text="Xem HTML", command=self._preview_html, state="disabled"
+        )
+        self.html_btn.pack(side="top", pady=(6, 0))
         ttk.Label(
             input_side,
-            text="Enter gửi\nShift+Enter xuống dòng",
+            text="Enter gửi\nShift+Enter xuống dòng\nCtrl+V dán ảnh",
             style="CardMuted.TLabel",
             font=(FONT, 8),
             justify="left",
         ).pack(side="top", pady=(6, 0))
         self.input_box.bind("<Return>", self._on_return)
         self.input_box.bind("<Shift-Return>", self._on_shift_return)
+        self.input_box.bind("<Control-v>", self._on_paste)
 
         self.attach_var = tk.StringVar(value="")
         self.attach_row = ttk.Frame(input_card)
@@ -315,26 +395,54 @@ class AgentApp:
         ttk.Label(status, textvariable=self.status_var, style="Muted.TLabel").grid(
             row=0, column=0, sticky="w"
         )
-        ttk.Label(status, text=str(self.cfg.workspace), style="Muted.TLabel").grid(
+        self.workspace_status = tk.StringVar(value=str(self.workspace))
+        ttk.Label(status, textvariable=self.workspace_status, style="Muted.TLabel").grid(
             row=0, column=1, sticky="e"
         )
 
-        self._append_hint()
+    def _restore_history(self) -> None:
+        turns = self.history.load(str(self.workspace))
+        if not turns:
+            self._append_hint()
+            return
+        self._render_conversation(
+            turns,
+            f"Đã khôi phục {len(turns)} lượt của workspace {self.workspace.name} "
+            f"từ lần trước ({self.cfg.chat_history.name}).\n",
+        )
+        self._log("info", f"Khôi phục {len(turns)} lượt của {self.workspace}")
+
+    def _render_conversation(self, turns: list[dict], note: str) -> None:
+        self.agent.reset()
+        self._set_html(_extract_html(turns[-1].get("answer", "")) if turns else None)
+        self.transcript.configure(state="normal")
+        self.transcript.delete("1.0", "end")
+        self.transcript.configure(state="disabled")
+        self._append_note(note)
+        for turn in turns:
+            stamp = _display_stamp(turn.get("created_at", ""))
+            self._append_chat("user", turn["question"], stamp)
+            self._append_chat("assistant", turn["answer"], stamp)
+            self.agent.messages.append({"role": "user", "content": turn["question"]})
+            self.agent.messages.append({"role": "assistant", "content": turn["answer"]})
 
     def _append_hint(self) -> None:
-        self.transcript.configure(state="normal")
-        self.transcript.insert(
-            "end",
+        self._append_note(
             "Sẵn sàng. Hỏi bất cứ điều gì — agent tự gọi tool/skill khi cần. "
-            "Dùng nút Ảnh… để đính kèm hình ảnh cho agent đọc.\n",
-            "hint",
+            "Dùng nút Ảnh… hoặc Ctrl+V để đính kèm hình ảnh; có thể yêu cầu "
+            "dựng HTML theo ảnh giao diện.\n"
         )
+
+    def _append_note(self, text: str) -> None:
+        self.transcript.configure(state="normal")
+        self.transcript.insert("end", text, "hint")
         self.transcript.configure(state="disabled")
+        self.transcript.see("end")
 
     # ---------- transcript & log ----------
 
-    def _append_chat(self, kind: str, text: str) -> None:
-        stamp = datetime.now().strftime("%H:%M")
+    def _append_chat(self, kind: str, text: str, stamp: str | None = None) -> None:
+        stamp = stamp or datetime.now().strftime("%H:%M")
         heads = {
             "user": (f"\nBạn · {stamp}\n", "user_head", "user"),
             "assistant": (f"\nAgent · {stamp}\n", "assistant_head", "assistant"),
@@ -413,6 +521,42 @@ class AgentApp:
         self.attach_var.set("")
         self.attach_row.grid_remove()
 
+    def _on_paste(self, event: tk.Event | None = None) -> str | None:
+        if self.busy:
+            return None
+        dest = Path(tempfile.gettempdir()) / "agent-paste.png"
+        try:
+            path = grab_clipboard_image(dest)
+        except OSError as exc:
+            self._log("error", f"Không lưu được ảnh dán từ clipboard: {exc}")
+            return None
+        if path is None:
+            return None
+        self._pending_image = str(path)
+        self.attach_var.set(f"Ảnh dán từ clipboard: {path.name}")
+        self.attach_row.grid()
+        self._log("info", f"Dán ảnh từ clipboard → {path}")
+        self.status_var.set("Đã dán ảnh từ clipboard. Nhấn Gửi để agent đọc.")
+        return "break"
+
+    def _set_html(self, code: str | None) -> None:
+        self._last_html = code
+        self.html_btn.configure(state="normal" if code else "disabled")
+
+    def _preview_html(self) -> None:
+        if not self._last_html:
+            return
+        target = self.workspace / "preview.html"
+        try:
+            target.write_text(self._last_html, encoding="utf-8", newline="\n")
+        except OSError as exc:
+            self._log("error", f"Không lưu được preview.html: {exc}")
+            self.status_var.set(f"Không lưu được preview.html: {exc}")
+            return
+        webbrowser.open(target.as_uri())
+        self._log("info", f"Đã lưu HTML → {target}")
+        self.status_var.set(f"Đã mở {target.name} trong trình duyệt.")
+
     def _worker_ask(self, text: str, images: list[str] | None = None, display: str | None = None) -> None:
         try:
             answer = self.agent.run(text, images=images)
@@ -440,7 +584,7 @@ class AgentApp:
                     self._handle_distill_done(payload)
         except queue.Empty:
             pass
-        self.root.after(100, self._poll)
+        self._poll_id = self.root.after(100, self._poll)
 
     def _handle_event(self, event: dict) -> None:
         name = event.get("name") or "?"
@@ -451,12 +595,30 @@ class AgentApp:
         elif event.get("type") == "tool_result":
             self._log("result", f"← {name}: {_clip(event.get('result') or '', 200)}")
             self.status_var.set("Model đang xử lý…")
+        elif event.get("type") == "vision_done":
+            self._log("info", f"Đã đọc xong {event.get('count', 1)} ảnh")
+            self.status_var.set(
+                "Đã đọc ảnh. Model đang dựng HTML…"
+                if event.get("ui")
+                else "Đã đọc ảnh. Model đang xử lý…"
+            )
 
     def _handle_answer(self, payload: dict) -> None:
         elapsed = time.monotonic() - self._started_at
         self._set_busy(False, f"Xong sau {elapsed:.0f}s.")
         self._append_chat("assistant", payload["answer"])
+        html = _extract_html(payload["answer"])
+        self._set_html(html)
+        if html:
+            self.status_var.set(f"Xong sau {elapsed:.0f}s. Bấm Xem HTML để mở bản dựng.")
         turn_id = self.memory.record_turn(payload["question"], payload["answer"], payload["skills"])
+        try:
+            self.history.append_turn(
+                payload["question"], payload["answer"], payload["skills"],
+                workspace=str(self.workspace),
+            )
+        except OSError as exc:
+            self._log("error", f"Không lưu được hội thoại: {exc}")
         used = f" · skill: {', '.join(payload['skills'])}" if payload["skills"] else ""
         self._log("info", f"Đã lưu lượt #{turn_id}{used}")
         self._refresh_last_turn()
@@ -524,6 +686,250 @@ class AgentApp:
         text.configure(yscrollcommand=scroll.set)
         text.insert("1.0", skill.read_body())
         text.configure(state="disabled")
+
+    # ---------- workspaces ----------
+
+    def _refresh_workspaces(self) -> None:
+        self._ws_items = self.workspaces.list()
+        self.workspace_box.configure(values=[item["name"] for item in self._ws_items])
+        index = next(
+            (i for i, item in enumerate(self._ws_items) if Path(item["path"]) == self.workspace),
+            -1,
+        )
+        if index >= 0:
+            self.workspace_box.current(index)
+        else:
+            self.workspace_box.set("")
+
+    def _on_workspace_selected(self, event: tk.Event | None = None) -> None:
+        index = self.workspace_box.current()
+        if not (0 <= index < len(self._ws_items)):
+            return
+        item = self._ws_items[index]
+        path = Path(item["path"])
+        if path == self.workspace:
+            return
+        if self.busy:
+            messagebox.showinfo(
+                "Đang bận", "Đợi agent trả lời xong rồi chuyển workspace.", parent=self.root
+            )
+            self._refresh_workspaces()
+            return
+        if not path.is_dir():
+            messagebox.showerror(
+                "Không tìm thấy", f"Thư mục workspace không tồn tại:\n{path}", parent=self.root
+            )
+            self._refresh_workspaces()
+            return
+        self.workspaces.set_active(item["id"])
+        self._switch_workspace(path)
+
+    def _switch_workspace(self, workspace: Path) -> None:
+        workspace = workspace.resolve()
+        if workspace == self.workspace:
+            return
+        self.workspace = workspace
+        self.cfg.workspace = workspace
+        os.environ["AGENT_WORKSPACE"] = str(workspace)
+        self.registry = self._make_registry()
+        self.agent.registry = self.registry
+        self.agent.update_system_prompt(
+            build_system_prompt(workspace, self.skills.catalog(), self.cfg.shell)
+        )
+        self._clear_image()
+        try:
+            turns = self.history.load(str(workspace))
+        except OSError as exc:
+            turns = []
+            self._log("error", f"Không đọc được lịch sử của workspace: {exc}")
+        if turns:
+            stamp = _display_stamp(turns[-1].get("created_at", ""))
+            self._render_conversation(
+                turns,
+                f"Workspace: {workspace}\n"
+                f"Đã khôi phục {len(turns)} lượt của workspace này (lượt cuối {stamp}).\n",
+            )
+        else:
+            self._reset_chat_view(f"Workspace: {workspace}\n")
+        self.workspace_status.set(str(workspace))
+        self._refresh_workspaces()
+        self._log("info", f"Chuyển workspace → {workspace}")
+        self.status_var.set(f"Workspace: {workspace.name}")
+
+    def _create_workspace(
+        self, parent: tk.Misc | None = None, refresh: Callable[[], None] | None = None
+    ) -> None:
+        if self.busy:
+            messagebox.showinfo("Đang bận", "Đợi agent trả lời xong đã.", parent=self.root)
+            return
+        parent_win = parent or self.root
+        base = filedialog.askdirectory(
+            parent=parent_win,
+            title="Chọn thư mục cha cho workspace mới",
+            initialdir=str(self.workspace.parent),
+        )
+        if not base:
+            return
+        name = simpledialog.askstring(
+            "Workspace mới",
+            "Tên workspace (cũng là tên thư mục):",
+            parent=parent_win,
+        )
+        if not name or not name.strip():
+            return
+        try:
+            item = self.workspaces.create(base, name)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Không tạo được workspace", str(exc), parent=parent_win)
+            return
+        self._switch_workspace(Path(item["path"]))
+        self.status_var.set(f"Đã tạo workspace {item['name']} · {item['path']}")
+        self._log("info", f"Tạo workspace {item['name']} tại {item['path']}")
+        if refresh:
+            refresh()
+
+    def _add_existing_workspace(
+        self, parent: tk.Misc | None = None, refresh: Callable[[], None] | None = None
+    ) -> None:
+        if self.busy:
+            messagebox.showinfo("Đang bận", "Đợi agent trả lời xong đã.", parent=self.root)
+            return
+        parent_win = parent or self.root
+        folder = filedialog.askdirectory(
+            parent=parent_win,
+            title="Chọn thư mục làm workspace",
+            initialdir=str(self.workspace.parent),
+        )
+        if not folder:
+            return
+        try:
+            item = self.workspaces.add(folder)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Không thêm được workspace", str(exc), parent=parent_win)
+            return
+        self._switch_workspace(Path(item["path"]))
+        self.status_var.set(f"Đang mở workspace {item['name']}.")
+        if refresh:
+            refresh()
+
+    def _open_workspaces(self) -> None:
+        if self.busy:
+            messagebox.showinfo("Đang bận", "Đợi agent trả lời xong đã.", parent=self.root)
+            return
+
+        win = self._dialog("Workspaces", "720x440")
+        body = ttk.Frame(win, padding=16)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        wrap = tk.Frame(body, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
+        wrap.grid(row=0, column=0, sticky="nsew")
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(0, weight=1)
+        listing = tk.Listbox(
+            wrap, bd=0, relief="flat", bg=SOFT, fg=FG, font=(FONT, 10),
+            activestyle="none", exportselection=False, highlightthickness=0,
+        )
+        listing.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(wrap, orient="vertical", command=listing.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        listing.configure(yscrollcommand=scroll.set)
+
+        items: list[dict] = []
+
+        def reload(select_id: str | None = None) -> None:
+            nonlocal items
+            items = self.workspaces.list()
+            counts = self.history.counts()
+            listing.delete(0, "end")
+            for item in items:
+                mark = " · đang mở" if item["active"] else ("" if item["exists"] else " · thiếu")
+                try:
+                    count = counts.get(str(Path(item["path"]).resolve()), 0)
+                except OSError:
+                    count = 0
+                history = f" · {count} hội thoại" if count else ""
+                listing.insert("end", f"{item['name']} — {item['path']}{history}{mark}")
+            if not items:
+                return
+            index = 0
+            if select_id:
+                index = next((i for i, item in enumerate(items) if item["id"] == select_id), 0)
+            else:
+                index = next((i for i, item in enumerate(items) if item["active"]), 0)
+            listing.selection_set(index)
+            listing.see(index)
+
+        def open_selected(event: tk.Event | None = None) -> None:
+            selection = listing.curselection()
+            if not selection:
+                return
+            item = items[selection[0]]
+            if item["active"]:
+                win.destroy()
+                return
+            if not item["exists"]:
+                messagebox.showerror(
+                    "Không tìm thấy",
+                    f"Thư mục workspace không tồn tại:\n{item['path']}",
+                    parent=win,
+                )
+                return
+            self.workspaces.set_active(item["id"])
+            win.destroy()
+            self._switch_workspace(Path(item["path"]))
+
+        def remove_selected() -> None:
+            selection = listing.curselection()
+            if not selection:
+                messagebox.showinfo("Chưa chọn", "Chọn một workspace để xóa khỏi danh sách.", parent=win)
+                return
+            item = items[selection[0]]
+            if item["active"]:
+                messagebox.showinfo(
+                    "Đang mở",
+                    "Workspace này đang mở. Mở workspace khác rồi xóa khỏi danh sách.",
+                    parent=win,
+                )
+                return
+            if not messagebox.askyesno(
+                "Xóa khỏi danh sách",
+                f"Bỏ '{item['name']}' khỏi danh sách?\nThư mục trên đĩa không bị xóa.",
+                parent=win,
+            ):
+                return
+            try:
+                self.workspaces.remove(item["id"])
+            except OSError as exc:
+                messagebox.showerror("Lỗi", str(exc), parent=win)
+                return
+            self._refresh_workspaces()
+            reload(item["id"])
+            self.status_var.set(f"Đã bỏ workspace {item['name']} khỏi danh sách.")
+
+        reload()
+        listing.bind("<Double-Button-1>", open_selected)
+        listing.bind("<Return>", open_selected)
+        listing.bind("<Delete>", lambda _event: remove_selected())
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        ttk.Button(
+            buttons, text="Tạo mới…",
+            command=lambda: self._create_workspace(win, lambda: reload()),
+        ).pack(side="left")
+        ttk.Button(
+            buttons, text="Thêm thư mục…",
+            command=lambda: self._add_existing_workspace(win, lambda: reload()),
+        ).pack(side="left", padx=(6, 0))
+        ttk.Button(buttons, text="Đóng", command=win.destroy).pack(side="right")
+        ttk.Button(buttons, text="Mở", style="Accent.TButton", command=open_selected).pack(
+            side="right", padx=(0, 8)
+        )
+        ttk.Button(buttons, text="Xóa khỏi DS", command=remove_selected).pack(
+            side="right", padx=(0, 8)
+        )
 
     # ---------- learning ----------
 
@@ -642,8 +1048,8 @@ class AgentApp:
 
         fmt = tk.StringVar(value="sft")
         min_rating = tk.IntVar(value=4)
-        default_sft = self.cfg.workspace / "data" / "sft.jsonl"
-        default_dpo = self.cfg.workspace / "data" / "dpo.jsonl"
+        default_sft = self.workspace / "data" / "sft.jsonl"
+        default_dpo = self.workspace / "data" / "dpo.jsonl"
         path_var = tk.StringVar(value=str(default_sft))
         custom = {"touched": False}
 
@@ -698,7 +1104,7 @@ class AgentApp:
         def run_export() -> None:
             out = Path(path_var.get().strip() or str(default_sft))
             if not out.is_absolute():
-                out = self.cfg.workspace / out
+                out = self.workspace / out
             try:
                 threshold = int(min_rating.get())
             except (tk.TclError, ValueError):
@@ -706,7 +1112,7 @@ class AgentApp:
             try:
                 if fmt.get() == "sft":
                     turns = self.memory.turns_with_min_rating(threshold)
-                    system_prompt = build_system_prompt(self.cfg.workspace, self.skills.catalog(), self.cfg.shell)
+                    system_prompt = build_system_prompt(self.workspace, self.skills.catalog(), self.cfg.shell)
                     count = export_sft(turns, system_prompt, out)
                     hint = f"rating >= {threshold}"
                 else:
@@ -731,6 +1137,160 @@ class AgentApp:
             side="right", padx=(0, 8)
         )
 
+    # ---------- history ----------
+
+    def _open_history(self) -> None:
+        if self.busy:
+            messagebox.showinfo("Đang bận", "Đợi agent trả lời xong đã.", parent=self.root)
+            return
+        items = self.history.conversations(str(self.workspace))
+        if not items:
+            messagebox.showinfo(
+                "Chưa có lịch sử",
+                f"Chưa có cuộc trò chuyện nào trong workspace '{self.workspace.name}'.\n"
+                "Hội thoại được lưu sau mỗi lượt trả lời.",
+                parent=self.root,
+            )
+            return
+
+        win = self._dialog(f"Lịch sử · {self.workspace.name}", "640x420")
+        body = ttk.Frame(win, padding=16)
+        body.pack(fill="both", expand=True)
+        body.columnconfigure(0, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        wrap = tk.Frame(body, bg=CARD, highlightthickness=1, highlightbackground=BORDER)
+        wrap.grid(row=0, column=0, sticky="nsew")
+        wrap.columnconfigure(0, weight=1)
+        wrap.rowconfigure(0, weight=1)
+        listing = tk.Listbox(
+            wrap, bd=0, relief="flat", bg=SOFT, fg=FG, font=(FONT, 10),
+            activestyle="none", exportselection=False, highlightthickness=0,
+        )
+        listing.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(wrap, orient="vertical", command=listing.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        listing.configure(yscrollcommand=scroll.set)
+
+        for item in items:
+            stamp = _display_stamp(item["updated_at"] or item["created_at"])
+            mark = " · đang mở" if item["active"] else ""
+            listing.insert(
+                "end", f"{stamp} · {item['count']} lượt{mark} — {_clip(item['preview'], 60)}"
+            )
+        current = next((index for index, item in enumerate(items) if item["active"]), 0)
+        listing.selection_set(current)
+        listing.see(current)
+
+        def reload(select_id: str | None = None) -> bool:
+            nonlocal items
+            items = self.history.conversations(str(self.workspace))
+            listing.delete(0, "end")
+            for item in items:
+                stamp = _display_stamp(item["updated_at"] or item["created_at"])
+                mark = " · đang mở" if item["active"] else ""
+                listing.insert(
+                    "end", f"{stamp} · {item['count']} lượt{mark} — {_clip(item['preview'], 60)}"
+                )
+            if not items:
+                return False
+            index = 0
+            if select_id:
+                index = next((i for i, item in enumerate(items) if item["id"] == select_id), 0)
+            listing.selection_set(index)
+            listing.see(index)
+            return True
+
+        def open_selected(event: tk.Event | None = None) -> None:
+            selection = listing.curselection()
+            if not selection:
+                return
+            item = items[selection[0]]
+            win.destroy()
+            if item["active"]:
+                return
+            self._open_conversation(item["id"])
+
+        def delete_selected() -> None:
+            selection = listing.curselection()
+            if not selection:
+                messagebox.showinfo("Chưa chọn", "Chọn một cuộc trò chuyện để xóa.", parent=win)
+                return
+            item = items[selection[0]]
+            stamp = _display_stamp(item["updated_at"] or item["created_at"])
+            if not messagebox.askyesno(
+                "Xóa hội thoại",
+                f"Xóa hội thoại {stamp} · {item['count']} lượt?\nKhông thể hoàn tác.",
+                parent=win,
+            ):
+                return
+            try:
+                self.history.delete(item["id"])
+            except OSError as exc:
+                messagebox.showerror("Lỗi xóa", str(exc), parent=win)
+                return
+            was_active = item["active"]
+            self._log("info", f"Đã xóa hội thoại {stamp} · {item['count']} lượt")
+            if was_active:
+                self._reset_chat_view(f"Workspace: {self.workspace}\n")
+            if not reload():
+                win.destroy()
+                self.status_var.set(
+                    f"Đã xóa hội thoại. Workspace '{self.workspace.name}' không còn lịch sử."
+                )
+                return
+            self.status_var.set(f"Đã xóa hội thoại {stamp}.")
+
+        def delete_all() -> None:
+            if not messagebox.askyesno(
+                "Xóa tất cả lịch sử",
+                f"Xóa toàn bộ {len(items)} cuộc trò chuyện của workspace "
+                f"'{self.workspace.name}'?\nKhông thể hoàn tác.",
+                parent=win,
+            ):
+                return
+            try:
+                self.history.clear_all(str(self.workspace))
+            except OSError as exc:
+                messagebox.showerror("Lỗi xóa", str(exc), parent=win)
+                return
+            win.destroy()
+            self._reset_chat_view(f"Workspace: {self.workspace}\n")
+            self._log(
+                "info",
+                f"Đã xóa toàn bộ lịch sử của workspace {self.workspace.name} ({len(items)} cuộc).",
+            )
+            self.status_var.set(f"Đã xóa toàn bộ lịch sử của workspace '{self.workspace.name}'.")
+
+        listing.bind("<Double-Button-1>", open_selected)
+        listing.bind("<Return>", open_selected)
+        listing.bind("<Delete>", lambda _event: delete_selected())
+
+        buttons = ttk.Frame(body)
+        buttons.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        ttk.Button(buttons, text="Xóa tất cả", command=delete_all).pack(side="left")
+        ttk.Button(buttons, text="Đóng", command=win.destroy).pack(side="right")
+        ttk.Button(buttons, text="Mở", style="Accent.TButton", command=open_selected).pack(
+            side="right", padx=(0, 8)
+        )
+        ttk.Button(buttons, text="Xóa", command=delete_selected).pack(side="right", padx=(0, 8))
+
+    def _open_conversation(self, conversation_id: str) -> None:
+        turns = self.history.open(conversation_id)
+        if not turns:
+            messagebox.showinfo(
+                "Không có dữ liệu", "Hội thoại này không còn lượt nào.", parent=self.root
+            )
+            return
+        stamp = _display_stamp(turns[-1].get("created_at", ""))
+        self._render_conversation(
+            turns,
+            f"Workspace: {self.workspace}\n"
+            f"Đang mở hội thoại đã lưu lúc {stamp} · {len(turns)} lượt.\n",
+        )
+        self._log("info", f"Mở hội thoại cũ · {len(turns)} lượt")
+        self.status_var.set(f"Đang mở hội thoại cũ · {len(turns)} lượt.")
+
     # ---------- misc ----------
 
     def _dialog(self, title: str, geometry: str) -> tk.Toplevel:
@@ -743,22 +1303,41 @@ class AgentApp:
         win.bind("<Escape>", lambda _event: win.destroy())
         return win
 
-    def _new_chat(self) -> None:
-        if self.busy:
-            return
+    def _reset_chat_view(self, note: str = "") -> None:
         self.agent.reset()
+        self._set_html(None)
         self.transcript.configure(state="normal")
         self.transcript.delete("1.0", "end")
         self.transcript.configure(state="disabled")
+        if note:
+            self._append_note(note)
         self._append_hint()
-        self._log("info", "Bắt đầu cuộc hội thoại mới.")
-        self.status_var.set("Đã xoá lịch sử hội thoại.")
+
+    def _new_chat(self) -> None:
+        if self.busy:
+            return
+        try:
+            archived = self.history.start_new(str(self.workspace))
+        except OSError as exc:
+            archived = False
+            self._log("error", f"Không lưu được cuộc trò chuyện trước: {exc}")
+        self._reset_chat_view(f"Workspace: {self.workspace}\n")
+        if archived:
+            self._log("info", "Đã lưu cuộc trò chuyện trước; bắt đầu cuộc mới.")
+            self.status_var.set("Đã lưu cuộc trò chuyện trước và bắt đầu cuộc mới.")
+        else:
+            self._log("info", "Bắt đầu cuộc hội thoại mới.")
+            self.status_var.set("Đã bắt đầu cuộc hội thoại mới.")
 
     def _on_close(self) -> None:
         if self.busy and not messagebox.askyesno(
             "Đang xử lý", "Agent đang trả lời. Vẫn thoát?", parent=self.root
         ):
             return
+        try:
+            self.root.after_cancel(self._poll_id)
+        except (tk.TclError, ValueError):
+            pass
         self.root.destroy()
 
 
