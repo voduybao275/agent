@@ -1,0 +1,28 @@
+# Cấu hình agent. Đổi provider đang dùng ở [provider] active.
+
+[agent]
+workspace = "."          # thư mục agent được đọc/ghi
+shell = "auto"           # auto | bash | cmd | powershell
+max_steps = 12
+temperature = 0.2
+timeout = 120
+
+[skills]
+dir = "skills"
+examples_in_context = 3   # số ví dụ đã học được chèn khi load_skill
+
+[memory]
+db = "memory.db"
+
+[provider]
+active = "ollama"        # đổi thành "openai" để dùng API cloud
+
+[providers.openai]
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
+
+[providers.ollama]
+base_url = "http://localhost:11434/v1"
+model = "qwen2.5:3b"
+api_key_env = ""
