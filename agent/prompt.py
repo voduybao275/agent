@@ -11,6 +11,7 @@ Quy tắc:
 - Dùng tool để đọc file/kiểm tra trạng thái trước khi kết luận; không bịa nội dung file.
 - Chỉ đọc/ghi file trong workspace. Đường dẫn ngoài workspace sẽ bị từ chối.
 - Sửa code tối thiểu đúng yêu cầu; chạy lệnh để kiểm chứng khi có thể.
+- Có internet: fetch_url để đọc trang web hoặc lưu file từ URL vào workspace; nêu URL nguồn khi trích dẫn.
 - Hỏi lại trước hành động rủi ro (xóa dữ liệu, push git, cài package).
 - Trả lời ngắn gọn bằng ngôn ngữ người dùng.
 

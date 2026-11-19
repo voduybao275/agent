@@ -4,11 +4,14 @@ import json
 import os
 import queue
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import tkinter as tk
+import urllib.request
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -25,6 +28,7 @@ from agent.prompt import build_system_prompt
 from agent.skills import SkillManager
 from agent.tools import ToolRegistry, build_builtin_tools, build_image_tool
 from agent.vision import Vision
+from agent.web import build_web_tools
 from agent.workspaces import WorkspaceManager
 from learning.distill import distill_skill
 from learning.export import export_dpo, export_sft
@@ -41,6 +45,33 @@ MUTED = "#68707c"
 DANGER = "#b42318"
 FONT = "Segoe UI"
 SIDE_WIDTH = 320
+
+PROJECT_DIR = Path(__file__).resolve().parent
+OLLAMA_EXE = PROJECT_DIR / ".tools" / "ollama" / "ollama.exe"
+OLLAMA_MODELS_DIR = PROJECT_DIR / ".ollama-models"
+OLLAMA_LOG = PROJECT_DIR / "data" / "ollama-serve.log"
+
+
+def _server_url(base_url: str) -> str:
+    base = base_url.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    return base + "/api/version"
+
+
+def _server_up(url: str, timeout: float = 1.5) -> bool:
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return 200 <= response.status < 300
+    except Exception:
+        return False
+
+
+def _find_ollama_exe() -> Path | None:
+    if OLLAMA_EXE.is_file():
+        return OLLAMA_EXE
+    found = shutil.which("ollama")
+    return Path(found) if found else None
 
 
 def _clip(text: str, limit: int) -> str:
@@ -124,6 +155,9 @@ class AgentApp:
         self._pending_image: str | None = None
         self._last_html: str | None = None
         self._ws_items: list[dict] = []
+        self.ollama_btn: ttk.Button | None = None
+        self._ollama_starting = False
+        self._ollama_proc: subprocess.Popen | None = None
 
         self.workspaces = WorkspaceManager(cfg.workspaces_file, cfg.workspace)
         default_workspace = cfg.workspace
@@ -171,12 +205,16 @@ class AgentApp:
         self._restore_history()
         self._log("info", f"Sẵn sàng · {cfg.provider.name}/{cfg.provider.model}")
         self._log("info", f"Workspace: {self.workspace}")
+        if cfg.provider.name == "ollama":
+            threading.Thread(target=self._ollama_startup_check, daemon=True).start()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._poll_id = self.root.after(100, self._poll)
 
     def _make_registry(self) -> ToolRegistry:
         registry = ToolRegistry()
         for spec in build_builtin_tools(self.workspace, self.cfg.shell):
+            registry.register(spec)
+        for spec in build_web_tools(self.workspace):
             registry.register(spec)
         self.skills.reset_tool_state()
         self.skills.register_load_tool(registry)
@@ -243,6 +281,11 @@ class AgentApp:
         ttk.Button(workspace_row, text="Quản lý", command=self._open_workspaces).pack(
             side="left", padx=(6, 0)
         )
+        if self.cfg.provider.name == "ollama":
+            self.ollama_btn = ttk.Button(
+                workspace_row, text="Bật Ollama", command=self._start_ollama
+            )
+            self.ollama_btn.pack(side="left", padx=(6, 0))
         ttk.Label(
             workspace_row,
             text=f"{self.cfg.provider.name}/{self.cfg.provider.model} · shell {self.cfg.shell}",
@@ -566,6 +609,102 @@ class AgentApp:
             return
         self.queue.put(("answer", {"question": display or text, "answer": answer, "skills": skills}))
 
+    # ---------- ollama ----------
+
+    def _ollama_startup_check(self) -> None:
+        if _server_up(_server_url(self.cfg.provider.base_url)):
+            self.queue.put(("ollama_state", "Ollama đã chạy sẵn."))
+        else:
+            self.queue.put(("log", "Ollama chưa chạy — bấm 'Bật Ollama' trên thanh workspace."))
+
+    def _start_ollama(self) -> None:
+        if self._ollama_starting:
+            return
+        exe = _find_ollama_exe()
+        if exe is None:
+            message = (
+                f"Không tìm thấy ollama.exe. Đặt vào {OLLAMA_EXE} "
+                "hoặc cài Ollama vào PATH."
+            )
+            self._log("error", message)
+            self.status_var.set(message)
+            return
+        self._ollama_starting = True
+        if self.ollama_btn is not None:
+            self.ollama_btn.configure(text="Đang bật…", state="disabled")
+        self._log("info", f"Kiểm tra Ollama server: {exe}")
+        self.status_var.set("Đang kiểm tra Ollama…")
+        threading.Thread(target=self._ollama_worker, args=(exe,), daemon=True).start()
+
+    def _ollama_worker(self, exe: Path) -> None:
+        url = _server_url(self.cfg.provider.base_url)
+        if _server_up(url):
+            self.queue.put(("ollama_done", {"ok": True, "message": "Ollama đã chạy sẵn."}))
+            return
+
+        env = os.environ.copy()
+        if OLLAMA_MODELS_DIR.is_dir():
+            env["OLLAMA_MODELS"] = str(OLLAMA_MODELS_DIR)
+
+        log = None
+        try:
+            OLLAMA_LOG.parent.mkdir(parents=True, exist_ok=True)
+            log = open(OLLAMA_LOG, "a", encoding="utf-8")
+        except OSError:
+            log = None
+
+        try:
+            proc = subprocess.Popen(
+                [str(exe), "serve"],
+                cwd=str(PROJECT_DIR),
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=log or subprocess.DEVNULL,
+                stderr=subprocess.STDOUT if log else subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError as exc:
+            if log:
+                log.close()
+            self.queue.put(("ollama_done", {"ok": False, "message": f"Không chạy được ollama.exe: {exc}"}))
+            return
+        self._ollama_proc = proc
+
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            time.sleep(0.5)
+            code = proc.poll()
+            if code is not None:
+                self.queue.put((
+                    "ollama_done",
+                    {"ok": False, "message": f"Ollama thoát sớm (mã {code}). Xem log: {OLLAMA_LOG}"},
+                ))
+                break
+            if _server_up(url):
+                self.queue.put((
+                    "ollama_done",
+                    {"ok": True, "message": f"Ollama sẵn sàng (PID {proc.pid}) · log: {OLLAMA_LOG}"},
+                ))
+                break
+        else:
+            self.queue.put((
+                "ollama_done",
+                {"ok": False, "message": f"Ollama chưa phản hồi sau 30s (PID {proc.pid}). Xem log: {OLLAMA_LOG}"},
+            ))
+        if log:
+            log.close()
+
+    def _handle_ollama_done(self, payload: dict) -> None:
+        self._ollama_starting = False
+        ok = bool(payload.get("ok"))
+        message = payload.get("message", "")
+        if self.ollama_btn is not None:
+            self.ollama_btn.configure(
+                text="Ollama ✓" if ok else "Bật Ollama", state="normal"
+            )
+        self._log("result" if ok else "error", message)
+        self.status_var.set("Ollama sẵn sàng." if ok else message)
+
     # ---------- queue ----------
 
     def _poll(self) -> None:
@@ -582,6 +721,12 @@ class AgentApp:
                     self._log("info", payload)
                 elif kind == "distill_done":
                     self._handle_distill_done(payload)
+                elif kind == "ollama_done":
+                    self._handle_ollama_done(payload)
+                elif kind == "ollama_state":
+                    if self.ollama_btn is not None:
+                        self.ollama_btn.configure(text="Ollama ✓")
+                    self._log("result", payload)
         except queue.Empty:
             pass
         self._poll_id = self.root.after(100, self._poll)

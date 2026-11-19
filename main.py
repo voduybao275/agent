@@ -29,6 +29,7 @@ def main() -> int:
     from agent.prompt import build_system_prompt
     from agent.skills import SkillManager
     from agent.tools import ToolRegistry, build_builtin_tools, build_image_tool
+    from agent.web import build_web_tools
     from learning.distill import distill_skill
     from learning.export import export_dpo, export_sft
     from learning.feedback import apply_feedback
@@ -80,6 +81,8 @@ def main() -> int:
 
     registry = ToolRegistry()
     for spec in build_builtin_tools(cfg.workspace, cfg.shell):
+        registry.register(spec)
+    for spec in build_web_tools(cfg.workspace):
         registry.register(spec)
     skills = SkillManager(cfg.skills_dir, cfg.examples_in_context)
     skills.register_load_tool(registry)
